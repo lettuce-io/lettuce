@@ -273,3 +273,4 @@ ubuntu
 behaviour
 databind
 jackson
+autoReconnect
