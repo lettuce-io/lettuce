@@ -15,6 +15,7 @@
  */
 package io.lettuce.core.protocol;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Deque;
@@ -40,6 +41,7 @@ import io.lettuce.core.RedisChannelWriter;
 import io.lettuce.core.RedisConnectionException;
 import io.lettuce.core.RedisException;
 import io.lettuce.core.api.push.PushListener;
+import io.lettuce.core.concurrency.OwnershipSynchronizer;
 import io.lettuce.core.constant.DummyContextualChannelInstances;
 import io.lettuce.core.context.AutoBatchFlushEndPointContext;
 import io.lettuce.core.context.ConnectionContext;
@@ -55,7 +57,6 @@ import io.netty.channel.ChannelFuture;
 import io.netty.channel.EventLoop;
 import io.netty.handler.codec.EncoderException;
 import io.netty.util.Recycler;
-import io.netty.util.concurrent.EventExecutor;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.GenericFutureListener;
 import io.netty.util.internal.logging.InternalLogger;
@@ -73,14 +74,14 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
 
     private static final AtomicLong ENDPOINT_COUNTER = new AtomicLong();
 
-    private static final AtomicReferenceFieldUpdater<DefaultAutoBatchFlushEndpoint, ContextualChannel> CHANNEL = AtomicReferenceFieldUpdater
-            .newUpdater(DefaultAutoBatchFlushEndpoint.class, ContextualChannel.class, "channel");
+    private static final AtomicReferenceFieldUpdater<DefaultAutoBatchFlushEndpoint, ContextualChannel> CHANNEL = AtomicReferenceFieldUpdater.newUpdater(
+            DefaultAutoBatchFlushEndpoint.class, ContextualChannel.class, "channel");
 
-    private static final AtomicIntegerFieldUpdater<DefaultAutoBatchFlushEndpoint> QUEUE_SIZE = AtomicIntegerFieldUpdater
-            .newUpdater(DefaultAutoBatchFlushEndpoint.class, "queueSize");
+    private static final AtomicIntegerFieldUpdater<DefaultAutoBatchFlushEndpoint> QUEUE_SIZE = AtomicIntegerFieldUpdater.newUpdater(
+            DefaultAutoBatchFlushEndpoint.class, "queueSize");
 
-    private static final AtomicIntegerFieldUpdater<DefaultAutoBatchFlushEndpoint> STATUS = AtomicIntegerFieldUpdater
-            .newUpdater(DefaultAutoBatchFlushEndpoint.class, "status");
+    private static final AtomicIntegerFieldUpdater<DefaultAutoBatchFlushEndpoint> STATUS = AtomicIntegerFieldUpdater.newUpdater(
+            DefaultAutoBatchFlushEndpoint.class, "status");
 
     private static final int ST_OPEN = 0;
 
@@ -160,7 +161,7 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
 
     private final UnboundedOfferFirstQueue<Object> taskQueue;
 
-    private final OwnershipSynchronizer taskQueueConsumeSync; // make sure only one consumer exists at any given time
+    private final OwnershipSynchronizer<UnboundedOfferFirstQueue<Object>> taskQueueConsumeSync; // make sure only one consumer exists at any given time
 
     private final boolean canFire;
 
@@ -195,14 +196,15 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
         this.rejectCommandsWhileDisconnected = isRejectCommand(clientOptions);
         long endpointId = ENDPOINT_COUNTER.incrementAndGet();
         this.cachedEndpointId = "0x" + Long.toHexString(endpointId);
-        this.taskQueue = clientOptions.getAutoBatchFlushOptions().usesMpscQueue() ? new JcToolsUnboundedMpscOfferFirstQueue<>()
+        this.taskQueue = clientOptions.getAutoBatchFlushOptions().usesMpscQueue()
+                ? new JcToolsUnboundedMpscOfferFirstQueue<>()
                 : new ConcurrentLinkedOfferFirstQueue<>();
         this.canFire = false;
         this.callbackOnClose = callbackOnClose;
         this.writeSpinCount = clientOptions.getAutoBatchFlushOptions().getWriteSpinCount();
         this.batchSize = clientOptions.getAutoBatchFlushOptions().getBatchSize();
-        this.taskQueueConsumeSync = new OwnershipSynchronizer(clientResources.eventExecutorGroup().next(),
-                Thread.currentThread().getName(), true/* allows to be preempted by first event loop thread */);
+        this.taskQueueConsumeSync = new OwnershipSynchronizer<>(taskQueue, clientResources.eventExecutorGroup().next(),
+                0 /* allows to be preempted by first event loop thread */, logger);
     }
 
     @Override
@@ -323,8 +325,16 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
             return;
         }
 
-        this.taskQueueConsumeSync.preempt(channel.eventLoop(), Thread.currentThread().getName(),
-                false /* disallow preempt until reached quiescent point, see onEndpointQuiescence() */);
+        try {
+            this.taskQueueConsumeSync.preempt(channel.eventLoop(),
+                    1 /* disallow preempt until reached quiescent point, see onEndpointQuiescence() */, Duration.ofSeconds(5));
+        } catch (OwnershipSynchronizer.FailedToPreemptOwnershipException e) {
+            logger.error("notifyChannelActive failed to preemt", e);
+            channel.close();
+            onUnexpectedState("notifyChannelActive", ConnectionContext.State.CONNECTED);
+            return;
+        }
+
         this.connectionError = null;
         this.inProtectMode = false;
         this.logPrefix = null;
@@ -361,7 +371,7 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
             }
 
             if (clientOptions.isCancelCommandsOnReconnectFailure()) {
-                resetInternal();
+                reset();
             }
 
             throw e;
@@ -379,11 +389,11 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
             return;
         }
 
-        taskQueueConsumeSync.execute(() -> {
+        taskQueueConsumeSync.execute(tq -> {
             if (isClosed()) {
-                onEndpointClosed();
+                onEndpointClosed(tq);
             } else {
-                onReconnectFailed();
+                onReconnectFailed(tq);
             }
         });
     }
@@ -419,8 +429,8 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
             return;
         }
 
-        boolean willReconnect = connectionWatchdog != null
-                && connectionWatchdog.willReconnectOnAutoBatchFlushEndpointQuiescence();
+        boolean willReconnect =
+                connectionWatchdog != null && connectionWatchdog.willReconnectOnAutoBatchFlushEndpointQuiescence();
         RedisException exception = null;
         // Unlike DefaultEndpoint, here we don't check reliability since connectionWatchdog.willReconnect() already does it.
         if (isClosed()) {
@@ -446,8 +456,8 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
             this.logPrefix = null;
             CHANNEL.set(this, DummyContextualChannelInstances.CHANNEL_ENDPOINT_CLOSED);
         }
-        inactiveChan.context
-                .setCloseStatus(new ConnectionContext.CloseStatus(willReconnect, retryablePendingCommands, exception));
+        inactiveChan.context.setCloseStatus(
+                new ConnectionContext.CloseStatus(willReconnect, retryablePendingCommands, exception));
         trySetEndpointQuiescence(inactiveChan);
     }
 
@@ -477,11 +487,11 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
                 taskQueueConsumeSync.execute(this::onEndpointClosed);
                 return;
             case RECONNECT_FAILED:
-                taskQueueConsumeSync.execute(() -> {
+                taskQueueConsumeSync.execute(tq -> {
                     if (isClosed()) {
-                        onEndpointClosed();
+                        onEndpointClosed(tq);
                     } else {
-                        onReconnectFailed();
+                        onReconnectFailed(tq);
                     }
                 });
                 return;
@@ -571,19 +581,7 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
         if (chan.context.initialState.isConnected()) {
             chan.pipeline().fireUserEventTriggered(new ConnectionEvents.Reset());
         }
-        taskQueueConsumeSync.execute(() -> cancelCommands("reset"));
-    }
-
-    private void resetInternal() {
-        if (debugEnabled) {
-            logger.debug("{} reset()", logPrefix());
-        }
-
-        ContextualChannel chan = channel;
-        if (chan.context.initialState.isConnected()) {
-            chan.pipeline().fireUserEventTriggered(new ConnectionEvents.Reset());
-        }
-        cancelCommands("resetInternal");
+        taskQueueConsumeSync.execute(tq -> cancelCommands(tq, "reset"));
     }
 
     /**
@@ -591,7 +589,7 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
      */
     @Override
     public void initialState() {
-        taskQueueConsumeSync.execute(() -> cancelCommands("initialState"));
+        taskQueueConsumeSync.execute(tq -> cancelCommands(tq, "initialState"));
 
         ContextualChannel currentChannel = this.channel;
         if (currentChannel.context.initialState.isConnected()) {
@@ -618,8 +616,8 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
             return buffer;
         }
 
-        final String buffer = "[CONNECTED, " + ChannelLogDescriptor.logDescriptor(chan.getDelegate()) + ", " + "epid=" + getId()
-                + ']';
+        final String buffer =
+                "[CONNECTED, " + ChannelLogDescriptor.logDescriptor(chan.getDelegate()) + ", " + "epid=" + getId() + ']';
         logPrefix = buffer;
         return buffer;
     }
@@ -631,14 +629,14 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
 
     private void scheduleSendJobOnConnected(final ContextualChannel chan) {
         // Schedule directly
-        loopSend(chan, false);
+        loopDrain(chan, false);
     }
 
     private void scheduleSendJobIfNeeded(final ContextualChannel chan) {
         final EventLoop eventLoop = chan.eventLoop();
         if (eventLoop.inEventLoop()) {
             // Possible in reactive() mode.
-            loopSend(chan, false);
+            loopDrain(chan, false);
             return;
         }
 
@@ -659,18 +657,24 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
             // Without tryEnter():
             // Avg latency: 0.6618976359375001ms
             // Avg QPS: 192240.1301551348/s
-            eventLoop.execute(() -> loopSend(chan, true));
+            try {
+                eventLoop.execute(() -> loopDrain(chan, true));
+            } catch (Exception e) {
+                logger.error("scheduleSendJobIfNeeded failed", e);
+                chan.context.autoBatchFlushEndPointContext.hasOngoingSendLoop.exit();
+                throw e;
+            }
         }
 
         // Otherwise:
         // 1. offer() (volatile write of producerIndex) synchronizes-before hasOngoingSendLoop.safe.get() == 1 (volatile read)
         // 2. hasOngoingSendLoop.safe.get() == 1 (volatile read) synchronizes-before
-        // hasOngoingSendLoop.safe.set(0) (volatile write) in first loopSend0()
+        // hasOngoingSendLoop.safe.set(0) (volatile write) in first loopDrain0()
         // 3. hasOngoingSendLoop.safe.set(0) (volatile write) synchronizes-before
         // taskQueue.isEmpty() (volatile read of producerIndex), which guarantees to see the offered task.
     }
 
-    private void loopSend(final ContextualChannel chan, boolean entered) {
+    private void loopDrain(final ContextualChannel chan, boolean entered) {
         final ConnectionContext connectionContext = chan.context;
         final AutoBatchFlushEndPointContext autoBatchFlushEndPointContext = connectionContext.autoBatchFlushEndPointContext;
         if (connectionContext.isChannelInactiveEventFired()
@@ -679,13 +683,13 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
         }
 
         LettuceAssert.assertState(channel == chan, "unexpected: channel not match but closeStatus == null");
-        loopSend0(autoBatchFlushEndPointContext, chan, writeSpinCount, entered);
+        loopDrain0(autoBatchFlushEndPointContext, chan, writeSpinCount, entered);
     }
 
-    private void loopSend0(final AutoBatchFlushEndPointContext autoBatchFlushEndPointContext, final ContextualChannel chan,
+    private void loopDrain0(final AutoBatchFlushEndPointContext autoBatchFlushEndPointContext, final ContextualChannel chan,
             int remainingSpinnCount, final boolean entered) {
         do {
-            final int count = DefaultAutoBatchFlushEndpoint.this.pollBatch(autoBatchFlushEndPointContext, chan);
+            final int count = pollAndFlushInBatch(autoBatchFlushEndPointContext, chan);
             if (count == 0) {
                 break;
             }
@@ -696,7 +700,7 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
 
         if (remainingSpinnCount <= 0) {
             // Don't need to exitUnsafe since we still have an ongoing consume tasks in this thread.
-            chan.eventLoop().execute(() -> loopSend(chan, entered));
+            chan.eventLoop().execute(() -> loopDrain(chan, entered));
             return;
         }
 
@@ -706,14 +710,17 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
             autoBatchFlushEndPointContext.hasOngoingSendLoop.exit();
             // Guarantee thread-safety: no dangling tasks in the queue, see scheduleSendJobIfNeeded()
             if (!taskQueue.isEmpty()) {
-                loopSend0(autoBatchFlushEndPointContext, chan, remainingSpinnCount, false);
+                loopDrain0(autoBatchFlushEndPointContext, chan, remainingSpinnCount, false);
             }
         }
     }
 
-    private int pollBatch(final AutoBatchFlushEndPointContext autoBatchFlushEndPointContext, ContextualChannel chan) {
+    private int pollAndFlushInBatch(final AutoBatchFlushEndPointContext autoBatchFlushEndPointContext, ContextualChannel chan) {
         int count = 0;
         while (count < batchSize) {
+            if (debugEnabled) {
+                taskQueueConsumeSync.assertIsOwnerThreadAndPreemptPrevented();
+            }
             final Object o = this.taskQueue.poll();
             if (o == null) {
                 break;
@@ -725,8 +732,7 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
                 channelWrite(chan, cmd).addListener(WrittenToChannel.newInstance(this, chan, cmd, false));
                 count++;
             } else {
-                @SuppressWarnings("unchecked")
-                Collection<? extends RedisCommand<?, ?, ?>> commands = (Collection<? extends RedisCommand<?, ?, ?>>) o;
+                @SuppressWarnings("unchecked") Collection<? extends RedisCommand<?, ?, ?>> commands = (Collection<? extends RedisCommand<?, ?, ?>>) o;
                 final int commandsSize = commands.size(); // size() could be expensive for some collections so cache it!
                 autoBatchFlushEndPointContext.add(commandsSize);
                 for (RedisCommand<?, ?, ?> cmd : commands) {
@@ -776,8 +782,7 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
 
     private void onWillReconnect(@Nonnull final ConnectionContext.CloseStatus closeStatus,
             final AutoBatchFlushEndPointContext autoBatchFlushEndPointContext) {
-        final @Nullable Deque<RedisCommand<?, ?, ?>> retryableFailedToSendTasks = autoBatchFlushEndPointContext
-                .getAndClearRetryableFailedToSendCommands();
+        final @Nullable Deque<RedisCommand<?, ?, ?>> retryableFailedToSendTasks = autoBatchFlushEndPointContext.getAndClearRetryableFailedToSendCommands();
         if (retryableFailedToSendTasks != null) {
             // Save retryable failed tasks
             logger.info(
@@ -799,7 +804,7 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
 
         // follow the same logic as DefaultEndpoint
         if (inProtectMode) {
-            cancelCommands("inProtectMode");
+            taskQueueConsumeSync.execute(tq -> cancelCommands(tq, "inProtectMode"));
         }
     }
 
@@ -807,12 +812,12 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
             final AutoBatchFlushEndPointContext autoBatchFlushEndPointContext) {
         // No need to use syncAfterTerminated() since we are already in the event loop.
         if (isClosed()) {
-            onEndpointClosed(closeStatus.getAndClearRetryablePendingCommands(),
-                    autoBatchFlushEndPointContext.getAndClearRetryableFailedToSendCommands());
+            taskQueueConsumeSync.execute(tq -> onEndpointClosed(tq, closeStatus.getAndClearRetryablePendingCommands(),
+                    autoBatchFlushEndPointContext.getAndClearRetryableFailedToSendCommands()));
         } else {
-            fulfillCommands("onConnectionClose called and won't reconnect",
-                    it -> it.completeExceptionally(closeStatus.getErr()), closeStatus.getAndClearRetryablePendingCommands(),
-                    autoBatchFlushEndPointContext.getAndClearRetryableFailedToSendCommands());
+            taskQueueConsumeSync.execute(tq -> fulfillCommands("onConnectionClose called and won't reconnect",
+                    it -> it.completeExceptionally(closeStatus.getErr()), tq, closeStatus.getAndClearRetryablePendingCommands(),
+                    autoBatchFlushEndPointContext.getAndClearRetryableFailedToSendCommands()));
         }
     }
 
@@ -843,29 +848,29 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
                 ((DemandAware.Sink) cmd).removeSource();
             }
         });
-        this.taskQueue.offerFirstAll(commands);
+        taskQueueConsumeSync.execute(tq -> tq.offerFirstAll(commands));
         QUEUE_SIZE.addAndGet(this, commands.size());
     }
 
-    private void cancelCommands(String message) {
-        fulfillCommands(message, RedisCommand::cancel);
+    private void cancelCommands(UnboundedOfferFirstQueue<Object> tq, String message) {
+        fulfillCommands(message, RedisCommand::cancel, tq);
     }
 
     @SafeVarargs
-    private final void onEndpointClosed(Queue<RedisCommand<?, ?, ?>>... queues) {
-        fulfillCommands("endpoint closed", callbackOnClose, queues);
+    private final void onEndpointClosed(UnboundedOfferFirstQueue<Object> tq, Queue<RedisCommand<?, ?, ?>>... queues) {
+        fulfillCommands("endpoint closed", callbackOnClose, tq, queues);
     }
 
-    private void onReconnectFailed() {
-        fulfillCommands("reconnect failed", cmd -> cmd.completeExceptionally(getFailedToReconnectReason()));
+    private void onReconnectFailed(UnboundedOfferFirstQueue<Object> tq) {
+        fulfillCommands("reconnect failed", cmd -> cmd.completeExceptionally(getFailedToReconnectReason()), tq);
     }
 
     @SafeVarargs
     @SuppressWarnings("java:S3776" /* Suppress cognitive complexity warning */)
     private final void fulfillCommands(String message, Consumer<RedisCommand<?, ?, ?>> commandConsumer,
-            Queue<RedisCommand<?, ?, ?>>... queues) {
+            UnboundedOfferFirstQueue<Object> taskQueue, Queue<RedisCommand<?, ?, ?>>... internalQueues) {
         int totalCancelledTaskNum = 0;
-        for (Queue<RedisCommand<?, ?, ?>> queue : queues) {
+        for (Queue<RedisCommand<?, ?, ?>> queue : internalQueues) {
             while (true) {
                 RedisCommand<?, ?, ?> cmd = queue.poll();
                 if (cmd == null) {
@@ -882,7 +887,7 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
 
         int cancelledTaskNumInTaskQueue = 0;
         while (true) {
-            Object o = this.taskQueue.poll();
+            Object o = taskQueue.poll();
             if (o == null) {
                 break;
             }
@@ -896,8 +901,7 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
                 cancelledTaskNumInTaskQueue++;
                 totalCancelledTaskNum++;
             } else {
-                @SuppressWarnings("unchecked")
-                Collection<? extends RedisCommand<?, ?, ?>> commands = (Collection<? extends RedisCommand<?, ?, ?>>) o;
+                @SuppressWarnings("unchecked") Collection<? extends RedisCommand<?, ?, ?>> commands = (Collection<? extends RedisCommand<?, ?, ?>>) o;
                 for (RedisCommand<?, ?, ?> cmd : commands) {
                     if (cmd.getOutput() != null) {
                         cmd.getOutput().setError(message);
@@ -974,12 +978,12 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
                 return getFailedToReconnectReason();
             case WILL_RECONNECT:
             case CONNECTING:
-                return rejectCommandsWhileDisconnectedLocal ? new RedisException("Currently not connected and " + rejectDesc)
+                return rejectCommandsWhileDisconnectedLocal
+                        ? new RedisException("Currently not connected and " + rejectDesc)
                         : null;
             case CONNECTED:
-                return !chan.isActive() && rejectCommandsWhileDisconnectedLocal
-                        ? new RedisException("Channel is inactive and " + rejectDesc)
-                        : null;
+                return !chan.isActive() && rejectCommandsWhileDisconnectedLocal ? new RedisException(
+                        "Channel is inactive and " + rejectDesc) : null;
             default:
                 throw new IllegalStateException("unexpected state: " + initialState);
         }
@@ -989,7 +993,7 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
         final ConnectionContext.State actual = this.channel.context.initialState;
         logger.error("{}[{}][unexpected] : unexpected state: exp '{}' got '{}'", logPrefix(), caller, exp, actual);
         taskQueueConsumeSync.execute(
-                () -> cancelCommands(String.format("%s: state not match: expect '%s', got '%s'", caller, exp, actual)));
+                tq -> cancelCommands(tq, String.format("%s: state not match: expect '%s', got '%s'", caller, exp, actual)));
     }
 
     private void channelFlush(Channel channel) {
@@ -1128,8 +1132,8 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
         }
 
         private boolean shouldNotRetry(Throwable cause) {
-            return endpoint.reliability == Reliability.AT_MOST_ONCE
-                    || ExceptionUtils.oneOf(cause, SHOULD_NOT_RETRY_EXCEPTION_TYPES);
+            return endpoint.reliability == Reliability.AT_MOST_ONCE || ExceptionUtils.oneOf(cause,
+                    SHOULD_NOT_RETRY_EXCEPTION_TYPES);
         }
 
         private void internalCloseConnectionIfNeeded(Throwable reason) {
@@ -1156,147 +1160,6 @@ public class DefaultAutoBatchFlushEndpoint implements RedisChannelWriter, AutoBa
             this.isActivationCommand = false;
 
             handle.recycle(this);
-        }
-
-    }
-
-    public static class OwnershipSynchronizer {
-
-        private static class Owner {
-
-            private final EventExecutor thread;
-
-            private final String threadName;
-
-            // if positive, no other thread can preempt the ownership.
-            private final int semaphore;
-
-            public Owner(EventExecutor thread, String threadName, int semaphore) {
-                LettuceAssert.assertState(semaphore >= 0, () -> String.format("negative semaphore: %d", semaphore));
-                this.thread = thread;
-                this.threadName = threadName;
-                this.semaphore = semaphore;
-            }
-
-            public boolean isCurrentThread() {
-                return thread.inEventLoop();
-            }
-
-            public Owner toAdd(int n) {
-                return new Owner(thread, threadName, semaphore + n);
-            }
-
-            public Owner toDone(int n) {
-                return new Owner(thread, threadName, semaphore - n);
-            }
-
-            public boolean isDone() {
-                return semaphore == 0;
-            }
-
-        }
-
-        private static final AtomicReferenceFieldUpdater<OwnershipSynchronizer, Owner> OWNER = AtomicReferenceFieldUpdater
-                .newUpdater(OwnershipSynchronizer.class, Owner.class, "owner");
-
-        private volatile Owner owner;
-
-        public OwnershipSynchronizer(EventExecutor thread, String threadName, boolean allowsPreemptByOtherThreads) {
-            this.owner = new Owner(thread, threadName, allowsPreemptByOtherThreads ? 0 : 1);
-        }
-
-        /**
-         * Preempt ownership only when there is no running tasks in current owner
-         *
-         * @param thread new thread
-         * @param threadName thread name
-         * @param allowsPreemptByOtherThreads whether allows a third thread to preempt after @param `thread` preempts from
-         *        current owner thread, if true, initial running task number will be set to 1.
-         */
-        public void preempt(EventExecutor thread, String threadName, boolean allowsPreemptByOtherThreads) {
-            Owner cur;
-            Owner newOwner = null;
-            while (true) {
-                cur = this.owner;
-                if (cur.thread == thread) {
-                    if (allowsPreemptByOtherThreads) {
-                        return;
-                    }
-                    if (OWNER.compareAndSet(this, cur, cur.toAdd(1))) { // prevent preempt
-                        return;
-                    }
-                    continue;
-                }
-
-                if (!cur.isDone()) {
-                    // unsafe to preempt
-                    continue;
-                }
-
-                if (newOwner == null) {
-                    newOwner = new Owner(thread, threadName, allowsPreemptByOtherThreads ? 0 : 1);
-                }
-                if (OWNER.compareAndSet(this, cur, newOwner)) {
-                    logger.debug("ownership preempted by a new thread [{}]", threadName);
-                    // established happens-before with done()
-                    return;
-                }
-            }
-        }
-
-        /**
-         * done n tasks in current owner.
-         *
-         * @param n number of tasks to be done.
-         */
-        public void done(int n) {
-            Owner cur;
-            do {
-                cur = this.owner;
-                assertIsOwnerThreadAndPreemptPrevented(cur);
-            } while (!OWNER.compareAndSet(this, cur, cur.toDone(n)));
-            // create happens-before with preempt()
-        }
-
-        /**
-         * Safely run a task in current owner thread and release its memory effect to next owner thread.
-         *
-         * @param task task to run
-         */
-        public void execute(Runnable task) {
-            Owner cur;
-            do {
-                cur = this.owner;
-                if (isOwnerCurrentThreadAndPreemptPrevented(cur)) {
-                    // already prevented preemption, safe to skip expensive add/done calls
-                    task.run();
-                    return;
-                }
-            } while (!OWNER.compareAndSet(this, cur, cur.toAdd(1)));
-
-            if (cur.isCurrentThread()) {
-                executeInOwnerWithPreemptPrevention(task);
-            } else {
-                cur.thread.execute(() -> executeInOwnerWithPreemptPrevention(task));
-            }
-        }
-
-        private void executeInOwnerWithPreemptPrevention(Runnable task) {
-            try {
-                task.run();
-            } finally {
-                done(1);
-            }
-        }
-
-        private void assertIsOwnerThreadAndPreemptPrevented(Owner cur) {
-            LettuceAssert.assertState(isOwnerCurrentThreadAndPreemptPrevented(cur),
-                    () -> "[executeInOwnerWithPreemptPrevention] unexpected: "
-                            + (cur.isCurrentThread() ? "preemption not prevented" : "owner is not this thread"));
-        }
-
-        private boolean isOwnerCurrentThreadAndPreemptPrevented(Owner owner) {
-            return owner.isCurrentThread() && !owner.isDone();
         }
 
     }
